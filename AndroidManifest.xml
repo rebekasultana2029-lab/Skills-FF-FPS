@@ -1,0 +1,193 @@
+package com.example.fpsoverlay
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.graphics.*
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.IBinder
+import android.util.DisplayMetrics
+import android.view.*
+import android.widget.TextView
+import kotlin.math.abs
+import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
+
+class ScreenCaptureService : Service() {
+
+    companion object {
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val EXTRA_RESULT_DATA = "result_data"
+        private const val NOTIF_ID = 42
+        private const val CH_ID = "fps_channel"
+    }
+
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: android.hardware.display.VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    private lateinit var wm: WindowManager
+    private lateinit var overlayView: TextView
+    private val fps = AtomicInteger(0)
+    private var frameCount = 0
+    private var lastSec = System.currentTimeMillis()
+    private var lastHash = 0L
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        startForegroundWithNotification()
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        addOverlay()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED) ?: return START_NOT_STICKY
+        val resultData = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA) ?: return START_NOT_STICKY
+
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = mpm.getMediaProjection(resultCode, resultData)
+
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val density = metrics.densityDpi
+
+        imageReader = ImageReader.newInstance(width / 2, height / 2, PixelFormat.RGBA_8888, 2)
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "fps-capture",
+            width / 2, height / 2, density,
+            0,
+            imageReader?.surface, null, null
+        )
+
+        imageReader?.setOnImageAvailableListener({ reader ->
+            val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                val plane = img.planes[0]
+                val buffer: ByteBuffer = plane.buffer
+                val rowStride = plane.rowStride
+                val pixelStride = plane.pixelStride
+                val w = img.width
+                val h = img.height
+
+                // Sample a small grid to compute a quick hash (fast & cheap).
+                var hash = 1125899906842597L
+                val stepY = (h / 16).coerceAtLeast(1)
+                val stepX = (w / 16).coerceAtLeast(1)
+                for (y in 0 until h step stepY) {
+                    val rowStart = y * rowStride
+                    for (x in 0 until w step stepX) {
+                        val idx = rowStart + x * pixelStride
+                        if (idx + 3 < buffer.limit()) {
+                            val r = buffer.get(idx).toInt() and 0xFF
+                            val g = buffer.get(idx + 1).toInt() and 0xFF
+                            val b = buffer.get(idx + 2).toInt() and 0xFF
+                            hash = hash * 31 + (r * 3 + g * 5 + b * 2)
+                        }
+                    }
+                }
+
+                val changed = abs(hash - lastHash) > 10_000 // tweak threshold
+                lastHash = hash
+                if (changed) frameCount++
+
+                val now = System.currentTimeMillis()
+                if (now - lastSec >= 1000) {
+                    fps.set(frameCount)
+                    frameCount = 0
+                    lastSec = now
+                    updateOverlay()
+                }
+            } catch (_: Throwable) {
+            } finally {
+                img.close()
+            }
+        }, null)
+
+        return START_STICKY
+    }
+
+    private fun addOverlay() {
+        overlayView = TextView(this).apply {
+            text = "FPS: --"
+            textSize = 14f
+            setPadding(12, 8, 12, 8)
+            setBackgroundColor(0x7F000000)
+            setTextColor(0xFFFFFFFF.toInt())
+        }
+
+        val type = if (Build.VERSION.SDK_INT >= 26)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else
+            WindowManager.LayoutParams.TYPE_PHONE
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 24; y = 24 }
+
+        // Make it draggable
+        overlayView.setOnTouchListener(object : View.OnTouchListener {
+            private var lastX = 0f; private var lastY = 0f
+            private var initX = 0; private var initY = 0
+            override fun onTouch(v: View?, e: MotionEvent): Boolean {
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        lastX = e.rawX; lastY = e.rawY
+                        initX = params.x; initY = params.y
+                        return true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        params.x = initX + (e.rawX - lastX).toInt()
+                        params.y = initY + (e.rawY - lastY).toInt()
+                        wm.updateViewLayout(overlayView, params)
+                        return true
+                    }
+                }
+                return false
+            }
+        })
+
+        wm.addView(overlayView, params)
+    }
+
+    private fun updateOverlay() {
+        overlayView.post {
+            overlayView.text = "FPS: ${fps.get()}"
+        }
+    }
+
+    private fun startForegroundWithNotification() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (mgr.getNotificationChannel(CH_ID) == null) {
+                val ch = NotificationChannel(CH_ID, "FPS Overlay", NotificationManager.IMPORTANCE_LOW)
+                mgr.createNotificationChannel(ch)
+            }
+        }
+        val notif = Notification.Builder(this, CH_ID)
+            .setContentTitle("FPS Overlay running")
+            .setSmallIcon(android.R.drawable.stat_notify_more)
+            .setOngoing(true)
+            .build()
+        startForeground(NOTIF_ID, notif)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { wm.removeView(overlayView) } catch (_: Throwable) {}
+        imageReader?.setOnImageAvailableListener(null, null)
+        imageReader?.close()
+        virtualDisplay?.release()
+        mediaProjection?.stop()
+    }
+}
